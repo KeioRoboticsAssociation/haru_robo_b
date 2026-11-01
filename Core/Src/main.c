@@ -55,10 +55,15 @@ COM_InitTypeDef BspCOMInit;
 
 volatile uint32_t can_rx_count = 0;
 volatile uint32_t can_rx_id = 0;
+volatile uint32_t can_rx_dlc = 0;
 volatile uint8_t can_rx_data[8] = {0};
 volatile uint32_t can_psr = 0;
 volatile uint32_t can_ecr = 0;
 volatile uint32_t can_clock = 0;
+volatile uint32_t can_error_events = 0;
+volatile uint32_t can_last_error = 0;
+volatile uint32_t can_rx_low_samples = 0;
+volatile uint32_t can_rx_sampled_edges = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -174,35 +179,102 @@ if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* CAN serial monitor: ST-LINK virtual COM, USART3 PD8/PD9. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  printf("\r\nH723 CAN serial monitor: Classic CAN, Normal, 250000 bps\r\n");
+  printf("Serial: 115200 8N1, no flow control; CAN RX: PA11, TX: PA12\r\n");
+  uint32_t last_rx_print = 0;
+  uint32_t last_printed_count = 0;
+  uint32_t last_status_print = 0;
+  uint32_t last_rx_level = (GPIOA->IDR & GPIO_PIN_11) != 0U;
   while (1)
   {
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-   if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0)
-{
-    FDCAN_RxHeaderTypeDef rxHeader;
-    uint8_t rxData[8] = {0};
-
-    if (HAL_FDCAN_GetRxMessage(
-            &hfdcan1,
-            FDCAN_RX_FIFO0,
-            &rxHeader,
-            rxData) == HAL_OK)
+    /* Passive sampling: this is not a complete waveform capture. */
+    uint32_t rx_level = (GPIOA->IDR & GPIO_PIN_11) != 0U;
+    if (rx_level == 0U && can_rx_low_samples != UINT32_MAX)
     {
+      can_rx_low_samples++;
+    }
+    if (rx_level != last_rx_level && can_rx_sampled_edges != UINT32_MAX)
+    {
+      can_rx_sampled_edges++;
+    }
+    last_rx_level = rx_level;
+
+    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U)
+    {
+      FDCAN_RxHeaderTypeDef rxHeader;
+      uint8_t rxData[8] = {0};
+      if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0,
+                                &rxHeader, rxData) == HAL_OK)
+      {
         can_rx_count++;
         can_rx_id = rxHeader.Identifier;
-
-        for (int i = 0; i < 8; i++)
+        can_rx_dlc = rxHeader.DataLength;
+        for (uint32_t i = 0; i < 8U; i++)
         {
-            can_rx_data[i] = rxData[i];
+          can_rx_data[i] = (i < can_rx_dlc) ? rxData[i] : 0U;
         }
+      }
     }
-}
-can_psr = hfdcan1.Instance->PSR;
-can_ecr = hfdcan1.Instance->ECR;
-can_clock = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
+
+    /* PSR.LEC/DLEC become 7 after reading; ECR.CEL clears on read. */
+    can_psr = hfdcan1.Instance->PSR;
+    can_ecr = hfdcan1.Instance->ECR;
+    uint32_t errors = (can_ecr & FDCAN_ECR_CEL) >> FDCAN_ECR_CEL_Pos;
+    if (UINT32_MAX - can_error_events < errors)
+    {
+      can_error_events = UINT32_MAX;
+    }
+    else
+    {
+      can_error_events += errors;
+    }
+    uint32_t lec = can_psr & FDCAN_PSR_LEC;
+    if (lec >= 1U && lec <= 6U)
+    {
+      can_last_error = lec;
+    }
+    can_clock = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
+
+    /* Log the latest frame at most every 100 ms; keep polling all frames. */
+    uint32_t now = HAL_GetTick();
+    if (can_rx_count != last_printed_count && now - last_rx_print >= 100U)
+    {
+      last_rx_print = now;
+      last_printed_count = can_rx_count;
+      printf("RX count=%lu ID=0x%03lX DLC=%lu DATA=",
+             (unsigned long)can_rx_count, (unsigned long)can_rx_id,
+             (unsigned long)can_rx_dlc);
+      for (uint32_t i = 0; i < can_rx_dlc && i < 8U; i++)
+      {
+        printf("%02X ", (unsigned int)can_rx_data[i]);
+      }
+      printf("\r\n");
+    }
+    if (now - last_status_print >= 1000U)
+    {
+      last_status_print = now;
+      printf("STATUS rx=%lu TEC=%lu REC=%lu PSR=0x%08lX FIFO=%lu CLK=%lu\r\n",
+             (unsigned long)can_rx_count,
+             (unsigned long)(can_ecr & FDCAN_ECR_TEC),
+             (unsigned long)((can_ecr & FDCAN_ECR_REC) >> FDCAN_ECR_REC_Pos),
+             (unsigned long)can_psr,
+             (unsigned long)HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0),
+             (unsigned long)can_clock);
+      printf("DIAG RXpin=%lu LOW=%lu EDGES=%lu ERR=%lu LAST_LEC=%lu CCCR=0x%08lX HAL=0x%08lX\r\n",
+             (unsigned long)rx_level,
+             (unsigned long)can_rx_low_samples,
+             (unsigned long)can_rx_sampled_edges,
+             (unsigned long)can_error_events,
+             (unsigned long)can_last_error,
+             (unsigned long)hfdcan1.Instance->CCCR,
+             (unsigned long)HAL_FDCAN_GetError(&hfdcan1));
+    }
   }
   /* USER CODE END 3 */
 }
